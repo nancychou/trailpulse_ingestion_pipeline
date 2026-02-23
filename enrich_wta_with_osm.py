@@ -128,7 +128,7 @@ session = requests.Session()
 session.headers.update(DEFAULT_HEADERS)
 
 
-def post_with_retry(urls: List[str], data: Any, timeout_s: int = 45, retries: int = 5) -> Optional[requests.Response]:
+def post_with_retry(urls: List[str], data: Any, timeout_s: int = 45, retries: int = 3) -> Optional[requests.Response]:
     last_err = None
     for attempt in range(1, retries + 1):
         url = urls[(attempt - 1) % len(urls)]
@@ -137,7 +137,7 @@ def post_with_retry(urls: List[str], data: Any, timeout_s: int = 45, retries: in
             if resp.status_code == 200:
                 return resp
             if resp.status_code in (429, 500, 502, 503, 504):
-                wait = min(90, (2 ** attempt) + random.uniform(0, 2))
+                wait = min(30, (2 ** attempt) + random.uniform(0, 2))
                 print(f"  HTTP {resp.status_code} from {url}; retry {attempt}/{retries} in {int(wait)}s")
                 time.sleep(wait)
                 continue
@@ -145,7 +145,7 @@ def post_with_retry(urls: List[str], data: Any, timeout_s: int = 45, retries: in
             last_err = Exception(f"HTTP {resp.status_code}")
         except requests.RequestException as e:
             last_err = e
-            wait = min(90, (2 ** attempt) + random.uniform(0, 2))
+            wait = min(30, (2 ** attempt) + random.uniform(0, 2))
             print(f"  Request error {e}; retry {attempt}/{retries} in {int(wait)}s")
             time.sleep(wait)
     if last_err:
@@ -301,7 +301,7 @@ def open_elevation_lookup(coords: List[Tuple[float, float]], batch_size: int = 9
         payload_json = json.dumps(payload)
 
         resp = None
-        for attempt in range(1, 6):
+        for attempt in range(1, 4):
             url = OPEN_ELEVATION_ENDPOINTS[(attempt - 1) % len(OPEN_ELEVATION_ENDPOINTS)]
             try:
                 r = session.post(url, data=payload_json, headers={"Content-Type": "application/json"}, timeout=45)
@@ -309,11 +309,11 @@ def open_elevation_lookup(coords: List[Tuple[float, float]], batch_size: int = 9
                     resp = r
                     break
                 if r.status_code in (429, 500, 502, 503, 504):
-                    wait = min(90, (2 ** attempt) + random.uniform(0, 2))
+                    wait = min(30, (2 ** attempt) + random.uniform(0, 2))
                     time.sleep(wait)
                     continue
             except requests.RequestException:
-                wait = min(90, (2 ** attempt) + random.uniform(0, 2))
+                wait = min(30, (2 ** attempt) + random.uniform(0, 2))
                 time.sleep(wait)
         if not resp:
             return None

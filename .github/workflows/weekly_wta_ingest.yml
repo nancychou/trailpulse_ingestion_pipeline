@@ -12,7 +12,7 @@ concurrency:
 jobs:
   ingest:
     runs-on: ubuntu-latest
-    timeout-minutes: 50
+    timeout-minutes: 120
 
     steps:
       - name: Checkout
@@ -33,7 +33,7 @@ jobs:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
         run: |
-          python -m pipeline.run_weekly --max-pages 40 --crawl-delay 60 --schema-version v1.0 --save-artifacts
+          python -m pipeline.run_weekly --max-pages 40 --crawl-delay 60 --timeout-minutes 110 --schema-version v1.0 --save-artifacts
 
       - name: Upload artifacts (debug)
         if: always()

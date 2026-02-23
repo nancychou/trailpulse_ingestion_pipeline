@@ -1,5 +1,7 @@
 from __future__ import annotations
+import time
 from dataclasses import asdict
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 import pandas as pd
@@ -20,11 +22,33 @@ OSM_NEW_COLS = [
     "geometry_polyline",
 ]
 
-def enrich_df_with_osm(df: pd.DataFrame, *, store_polyline: bool = True) -> pd.DataFrame:
+def enrich_df_with_osm(
+    df: pd.DataFrame,
+    *,
+    store_polyline: bool = True,
+    deadline: Optional[datetime] = None,
+) -> pd.DataFrame:
     if df.empty:
         return df
     records = df.where(pd.notnull(df), None).to_dict(orient="records")
-    enriched = [asdict(enrich_row(r, store_polyline=store_polyline)) for r in records]
+    enriched = []
+    total = len(records)
+    for idx, r in enumerate(records, start=1):
+        # Check deadline (need at least 2 min for scoring + upsert)
+        if deadline:
+            remaining = (deadline - datetime.now(timezone.utc)).total_seconds()
+            if remaining < 120:
+                print(f"   ⏰ Deadline approaching ({remaining:.0f}s left), skipping remaining {total - idx + 1} enrichments")
+                # Add unenriched rows as-is
+                for skip_r in records[idx - 1:]:
+                    enriched.append(skip_r)
+                break
+        trail_name = r.get("name", "Unknown")
+        print(f"   [{idx}/{total}] Enriching: {trail_name}...")
+        t0 = time.time()
+        enriched.append(asdict(enrich_row(r, store_polyline=store_polyline)))
+        elapsed = time.time() - t0
+        print(f"   [{idx}/{total}] ✅ Done ({elapsed:.1f}s)")
     out = pd.DataFrame(enriched)
 
     # Only pick the new OSM columns (plus id for joining)

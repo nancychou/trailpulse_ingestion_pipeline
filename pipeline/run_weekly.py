@@ -4,9 +4,10 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
 import uuid
-from datetime import datetime, timezone
-from typing import Any, Dict, List, Tuple
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 import requests
@@ -41,8 +42,14 @@ def main():
     ap.add_argument("--schema-version", default="v1.0")
     ap.add_argument("--max-pages", type=int, default=int(os.getenv("MAX_PAGES_PER_RUN", "50")))
     ap.add_argument("--crawl-delay", type=int, default=int(os.getenv("WTA_CRAWL_DELAY_S", "60")))
+    ap.add_argument("--timeout-minutes", type=int, default=0,
+                    help="Graceful deadline in minutes from now. 0 = no deadline.")
     ap.add_argument("--save-artifacts", action="store_true")
     args = ap.parse_args()
+
+    deadline: Optional[datetime] = None
+    if args.timeout_minutes > 0:
+        deadline = datetime.now(timezone.utc) + timedelta(minutes=args.timeout_minutes)
 
     run_id = new_run_id()
     started_at = utc_now_iso()
@@ -53,6 +60,8 @@ def main():
     print(f"   Run ID:  {run_id}")
     print(f"   Version: {dataset_version}")
     print(f"   Config:  max_pages={args.max_pages}, crawl_delay={args.crawl_delay}s")
+    if deadline:
+        print(f"   Deadline: {deadline.isoformat()} ({args.timeout_minutes} min from now)")
     print("=" * 60)
 
     print("\n📡 Connecting to Supabase...")
@@ -97,6 +106,7 @@ def main():
             to_crawl,
             max_pages=args.max_pages,
             crawl_delay_s=args.crawl_delay,
+            deadline=deadline,
         )
         stats["crawled_rows"] = int(len(df_wta))
         stats["failed_urls"] = int(len(failed_urls))
@@ -170,7 +180,7 @@ def main():
 
         # Enrich
         print(f"\n🌍 Enriching {len(df_wta)} trails with OSM data...")
-        df_enriched = enrich_df_with_osm(df_wta, store_polyline=True)
+        df_enriched = enrich_df_with_osm(df_wta, store_polyline=True, deadline=deadline)
         stats["enriched_rows"] = int(len(df_enriched))
         osm_matched = df_enriched["match_confidence"].notna().sum() if "match_confidence" in df_enriched.columns else 0
         print(f"   ✅ Enriched {len(df_enriched)} trails ({osm_matched} matched in OSM)")
@@ -237,13 +247,24 @@ def main():
             "notes": "",
         })
 
+        # Compute remaining uncrawled for auto-continuation
+        remaining_uncrawled = len(never) - stats.get("crawled_rows", 0)
+        stats["remaining_uncrawled"] = max(0, remaining_uncrawled)
+
         print("\n" + "=" * 60)
         print("✅ Pipeline completed successfully!")
         print(f"   Trails crawled:  {stats.get('crawled_rows', 0)}")
         print(f"   Trails upserted: {stats.get('upserted', 0)}")
+        print(f"   Remaining uncrawled: {stats['remaining_uncrawled']}")
         print(f"   Duration: {started_at} → {finished_at}")
         print("=" * 60)
         print(json.dumps({"ok": True, **stats}, indent=2))
+
+        # Write to GITHUB_OUTPUT for workflow chaining
+        gh_output = os.getenv("GITHUB_OUTPUT")
+        if gh_output:
+            with open(gh_output, "a") as f:
+                f.write(f"remaining_uncrawled={stats['remaining_uncrawled']}\n")
 
     except Exception as e:
         finished_at = utc_now_iso()

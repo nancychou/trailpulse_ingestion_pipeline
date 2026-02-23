@@ -4,13 +4,17 @@ on:
   workflow_dispatch:
     inputs:
       max_pages:
-        description: "Max pages to crawl in this bootstrap run"
+        description: "Max pages to crawl in this bootstrap chunk"
         required: true
-        default: "500"
+        default: "200"
       schema_version:
         description: "Schema version tag for this run"
         required: true
         default: "v1.0"
+      chunk:
+        description: "Current chunk number (auto-incremented on re-trigger)"
+        required: false
+        default: "1"
 
 concurrency:
   group: weekly-wta-ingestion
@@ -35,7 +39,8 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run bootstrap pipeline
+      - name: Run bootstrap pipeline (chunk ${{ inputs.chunk }})
+        id: pipeline
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
@@ -43,6 +48,7 @@ jobs:
           python -m pipeline.run_weekly \
             --max-pages ${{ inputs.max_pages }} \
             --crawl-delay 60 \
+            --timeout-minutes 300 \
             --schema-version ${{ inputs.schema_version }} \
             --save-artifacts
 
@@ -50,6 +56,18 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: trailpulse_bootstrap_artifacts
+          name: trailpulse_bootstrap_chunk${{ inputs.chunk }}_artifacts
           path: artifacts/
           if-no-files-found: ignore
+
+      - name: Re-trigger next chunk if needed
+        if: steps.pipeline.outputs.remaining_uncrawled > 0 && inputs.chunk < 10
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          NEXT_CHUNK=$(( ${{ inputs.chunk }} + 1 ))
+          echo "🔄 Re-triggering chunk ${NEXT_CHUNK} (${{ steps.pipeline.outputs.remaining_uncrawled }} URLs remaining)"
+          gh workflow run bootstrap_wta_ingest.yml \
+            -f max_pages=${{ inputs.max_pages }} \
+            -f schema_version=${{ inputs.schema_version }} \
+            -f chunk=${NEXT_CHUNK}

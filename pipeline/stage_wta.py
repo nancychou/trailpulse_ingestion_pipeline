@@ -2,7 +2,8 @@ from __future__ import annotations
 import random
 import time
 from dataclasses import asdict
-from typing import List, Tuple
+from datetime import datetime, timezone
+from typing import List, Optional, Tuple
 
 import pandas as pd
 
@@ -15,6 +16,7 @@ def crawl_changed_wta_pages(
     *,
     max_pages: int,
     crawl_delay_s: int = 60,
+    deadline: Optional[datetime] = None,
     user_agent: str = "TrailPulseCrawler/1.0 (contact: you@example.com)",
 ) -> Tuple[pd.DataFrame, List[str]]:
     crawler = WTATrailCrawler(
@@ -25,6 +27,12 @@ def crawl_changed_wta_pages(
     failed_urls: List[str] = []
     total = min(max_pages, len(urls))
     for idx, url in enumerate(urls[:max_pages], start=1):
+        # Check deadline before each page (need at least 5 min for enrichment + upsert)
+        if deadline:
+            remaining = (deadline - datetime.now(timezone.utc)).total_seconds()
+            if remaining < 300:
+                print(f"   ⏰ Deadline approaching ({remaining:.0f}s left), stopping crawl after {idx - 1}/{total} pages")
+                break
         trail_name = url.rstrip("/").split("/")[-1].replace("-", " ").title()
         print(f"   [{idx}/{total}] Crawling: {trail_name}...")
         t0 = time.time()
@@ -37,7 +45,7 @@ def crawl_changed_wta_pages(
         out.append(asdict(rec))
         print(f"   [{idx}/{total}] ✅ {rec.name} ({elapsed:.1f}s)")
         # politeness
-        wait = max(1.0, crawl_delay_s - elapsed) + random.uniform(0.5, 3.0)
+        wait = max(1.0, crawl_delay_s - elapsed) + random.uniform(0.5, 1.5)
         if idx < total:
             print(f"   ⏳ Waiting {wait:.0f}s before next page...")
         time.sleep(wait)
