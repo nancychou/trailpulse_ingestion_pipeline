@@ -6,7 +6,7 @@ on:
       max_pages:
         description: "Max pages to crawl in this bootstrap chunk"
         required: true
-        default: "200"
+        default: "80"
       schema_version:
         description: "Schema version tag for this run"
         required: true

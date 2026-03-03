@@ -15,7 +15,7 @@ There are two GitHub Actions workflows:
 1. `Bootstrap WTA Ingestion`
 - Manual trigger only (`workflow_dispatch`)
 - Intended for initial backfill / catch-up runs
-- Default: `max_pages=500`, fixed `crawl_delay=60` (WTA requirement)
+- Default: `max_pages=300`, fixed `crawl_delay=60` (WTA requirement)
 
 2. `Weekly WTA Ingestion`
 - Scheduled weekly and manually triggerable

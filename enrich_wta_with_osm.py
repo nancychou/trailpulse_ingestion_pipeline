@@ -179,13 +179,13 @@ SURFACE_MAP = {
 
 def overpass_candidates(lat: float, lng: float, radius_m: int = 1200) -> Dict[str, Any]:
     query = f"""
-    [out:json][timeout:50];
+    [out:json][timeout:60];
     (
       way(around:{radius_m},{lat},{lng})["highway"~"path|footway|track"]["access"!="private"];
       way(around:{radius_m},{lat},{lng})["highway"="bridleway"]["access"!="private"];
       relation(around:{radius_m},{lat},{lng})["route"="hiking"];
     );
-    out tags geom;
+    out body geom;
     """
     resp = post_with_retry(OVERPASS_ENDPOINTS, data=query)
     if not resp:
@@ -227,16 +227,21 @@ def resample_polyline(coords: List[Tuple[float, float]], step_m: float = 40.0, m
     return out
 
 
+def _get_element_coords(el: Dict[str, Any]) -> List[Tuple[float, float]]:
+    """Extract coords from either a way (geometry) or relation (members)."""
+    if el.get("type") == "relation":
+        return extract_relation_coords(el)
+    return extract_way_coords(el)
+
+
 def score_candidate(wta_name: str, wta_dist_mi: Optional[float], lat: float, lng: float, el: Dict[str, Any]) -> float:
     tags = el.get("tags", {}) or {}
     osm_name = tags.get("name") or tags.get("official_name") or tags.get("alt_name") or ""
     name_score = seq_ratio(normalize_name(wta_name), normalize_name(osm_name)) if osm_name else 0.1
 
+    coords = _get_element_coords(el)
+
     prox_score = 0.0
-    geom = el.get("geometry") or []
-    coords = []
-    if isinstance(geom, list):
-        coords = [(p["lat"], p["lon"]) for p in geom if isinstance(p, dict) and "lat" in p and "lon" in p]
     if coords:
         mind = min(haversine_m(lat, lng, a, b) for a, b in coords)
         prox_score = max(0.0, 1.0 - min(1.0, mind / 800.0))
@@ -247,12 +252,13 @@ def score_candidate(wta_name: str, wta_dist_mi: Optional[float], lat: float, lng
         ratio = min(osm_mi, wta_dist_mi) / max(osm_mi, wta_dist_mi) if osm_mi and wta_dist_mi else 0.0
         dist_score = ratio
 
-    type_bonus = 0.15 if el.get("type") == "way" else 0.05
+    # Prefer relations (complete trails) over individual ways (fragments)
+    type_bonus = 0.20 if el.get("type") == "relation" else 0.05
     hw = tags.get("highway", "")
-    trail_bonus = 0.15 if hw in ("path", "track", "footway", "bridleway") else 0.0
+    trail_bonus = 0.10 if hw in ("path", "track", "footway", "bridleway") else 0.0
     sac_bonus = 0.05 if tags.get("sac_scale") else 0.0
 
-    return 0.55 * name_score + 0.2 * prox_score + 0.15 * dist_score + type_bonus + trail_bonus + sac_bonus
+    return 0.50 * name_score + 0.20 * prox_score + 0.15 * dist_score + type_bonus + trail_bonus + sac_bonus
 
 
 def pick_best_osm_feature(wta_name: str, wta_dist_mi: Optional[float], lat: float, lng: float) -> Tuple[Optional[Dict[str, Any]], float]:
@@ -281,12 +287,165 @@ def extract_way_coords(el: Dict[str, Any]) -> List[Tuple[float, float]]:
     return coords
 
 
+def extract_relation_coords(el: Dict[str, Any]) -> List[Tuple[float, float]]:
+    """
+    Extract ordered coordinates from a hiking relation by stitching member ways.
+    Handles direction: reverses ways if endpoints don't connect.
+    """
+    members = el.get("members") or []
+    way_segments: List[List[Tuple[float, float]]] = []
+    for m in members:
+        if m.get("type") != "way":
+            continue
+        geom = m.get("geometry") or []
+        seg = []
+        for p in geom:
+            if isinstance(p, dict) and "lat" in p and "lon" in p:
+                seg.append((float(p["lat"]), float(p["lon"])))
+        if seg:
+            way_segments.append(seg)
+
+    if not way_segments:
+        return []
+
+    # Stitch segments in order, reversing if needed to connect endpoints
+    result = list(way_segments[0])
+    for seg in way_segments[1:]:
+        if not result or not seg:
+            result.extend(seg)
+            continue
+        tail = result[-1]
+        # Check which end of the new segment connects to the tail
+        d_fwd = haversine_m(tail[0], tail[1], seg[0][0], seg[0][1])
+        d_rev = haversine_m(tail[0], tail[1], seg[-1][0], seg[-1][1])
+        if d_rev < d_fwd:
+            seg = list(reversed(seg))
+        # Skip the first point if it's essentially the same as the tail (avoid dups)
+        if haversine_m(tail[0], tail[1], seg[0][0], seg[0][1]) < 5.0:
+            seg = seg[1:]
+        result.extend(seg)
+
+    return result
+
+
+def stitch_ways_from_trailhead(
+    lat: float,
+    lng: float,
+    wta_dist_mi: Optional[float],
+    candidates: List[Dict[str, Any]],
+) -> Tuple[List[Tuple[float, float]], List[Dict[str, Any]]]:
+    """
+    Stitch connected ways outward from the trailhead until accumulated
+    distance ≈ WTA's reported distance. Returns (coords, used_elements).
+    """
+    # Filter to only ways with geometry
+    ways = []
+    for el in candidates:
+        if el.get("type") != "way":
+            continue
+        coords = extract_way_coords(el)
+        if len(coords) >= 2:
+            ways.append((el, coords))
+
+    if not ways:
+        return [], []
+
+    target_m = (wta_dist_mi or 5.0) * 1609.344  # default ~5 mi if unknown
+
+    # Find the way whose start or end is closest to trailhead
+    def endpoint_dist(coords: List[Tuple[float, float]]) -> float:
+        return min(
+            haversine_m(lat, lng, coords[0][0], coords[0][1]),
+            haversine_m(lat, lng, coords[-1][0], coords[-1][1]),
+        )
+
+    ways.sort(key=lambda w: endpoint_dist(w[1]))
+    seed_el, seed_coords = ways[0]
+
+    # Orient seed so the end closest to trailhead is at index 0
+    if haversine_m(lat, lng, seed_coords[-1][0], seed_coords[-1][1]) < \
+       haversine_m(lat, lng, seed_coords[0][0], seed_coords[0][1]):
+        seed_coords = list(reversed(seed_coords))
+
+    result = list(seed_coords)
+    used = {id(seed_el)}
+    used_elements = [seed_el]
+    accumulated_m = geometry_length_m(result)
+
+    # Greedily stitch connected ways
+    max_iters = 50
+    for _ in range(max_iters):
+        if accumulated_m >= target_m * 0.9:
+            break
+        tail = result[-1]
+        best_way = None
+        best_coords = None
+        best_dist = 80.0  # max gap in meters to consider "connected"
+        for el, coords in ways:
+            if id(el) in used:
+                continue
+            d_start = haversine_m(tail[0], tail[1], coords[0][0], coords[0][1])
+            d_end = haversine_m(tail[0], tail[1], coords[-1][0], coords[-1][1])
+            min_d = min(d_start, d_end)
+            if min_d < best_dist:
+                best_dist = min_d
+                best_way = el
+                if d_end < d_start:
+                    best_coords = list(reversed(coords))
+                else:
+                    best_coords = list(coords)
+        if best_way is None or best_coords is None:
+            break
+        used.add(id(best_way))
+        used_elements.append(best_way)
+        # Skip duplicate start point
+        if haversine_m(tail[0], tail[1], best_coords[0][0], best_coords[0][1]) < 5.0:
+            best_coords = best_coords[1:]
+        result.extend(best_coords)
+        accumulated_m = geometry_length_m(result)
+
+    return result, used_elements
+
+
 def surface_from_tags(tags: Dict[str, Any]) -> Optional[str]:
     s = tags.get("surface")
     if not s:
         return None
     s = str(s).strip().lower()
     return SURFACE_MAP.get(s)
+
+
+def compute_surface_breakdown(
+    elements: List[Dict[str, Any]],
+) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Compute length-weighted surface breakdown from multiple way elements.
+    Returns (surface_primary, surface_breakdown_json).
+    """
+    surface_lengths: Dict[str, float] = {}
+    total_length = 0.0
+    for el in elements:
+        if el.get("type") != "way":
+            continue
+        tags = el.get("tags", {}) or {}
+        surf = surface_from_tags(tags)
+        if not surf:
+            continue
+        coords = extract_way_coords(el)
+        seg_len = geometry_length_m(coords) if len(coords) >= 2 else 0.0
+        if seg_len <= 0:
+            continue
+        surface_lengths[surf] = surface_lengths.get(surf, 0.0) + seg_len
+        total_length += seg_len
+
+    if not surface_lengths or total_length <= 0:
+        return None, None
+
+    breakdown = {k: round(v / total_length, 2) for k, v in sorted(
+        surface_lengths.items(), key=lambda x: -x[1]
+    )}
+    primary = max(surface_lengths, key=lambda k: surface_lengths[k])
+    return primary, json.dumps(breakdown)
 
 
 # ------------------------------ Elevation + Grade ------------------------------
@@ -442,14 +601,53 @@ def enrich_row(row: Dict[str, Any], *, store_polyline: bool = True) -> EnrichedT
     out.osm_name = tags.get("name")
     out.match_confidence = round(conf, 3)
 
-    coords = extract_way_coords(best) if best.get("type") == "way" else []
+    coords: List[Tuple[float, float]] = []
+    surface_elements: List[Dict[str, Any]] = []
+
+    if best.get("type") == "relation":
+        # Full trail geometry from hiking relation
+        coords = extract_relation_coords(best)
+        # Collect member way elements for surface breakdown
+        for m in (best.get("members") or []):
+            if m.get("type") == "way" and m.get("tags"):
+                surface_elements.append(m)
+        if not surface_elements:
+            # Relation-level tags as fallback
+            surface_elements = [best]
+    elif best.get("type") == "way":
+        coords = extract_way_coords(best)
+        surface_elements = [best]
+
+    # If we got a single way that's much shorter than the WTA distance,
+    # try stitching connected ways from the trailhead
+    if coords and wta_dist:
+        osm_mi = geometry_length_m(coords) / 1609.344
+        if osm_mi < wta_dist * 0.4 and best.get("type") == "way":
+            # Re-query all candidates and stitch
+            all_data = overpass_candidates(lat, lng, radius_m=2600)
+            all_elements = all_data.get("elements") or []
+            stitched, used_els = stitch_ways_from_trailhead(
+                lat, lng, wta_dist, all_elements
+            )
+            if stitched and geometry_length_m(stitched) > geometry_length_m(coords):
+                coords = stitched
+                surface_elements = used_els
+                out.osm_type = "stitched"
+
     if coords:
         out.osm_distance_mi = round(geometry_length_m(coords) / 1609.344, 2)
 
-        surf = surface_from_tags(tags)
-        if surf:
-            out.surface_primary = surf
-            out.surface_breakdown = json.dumps({surf: 1.0})
+        # Length-weighted surface breakdown
+        if surface_elements:
+            primary, breakdown = compute_surface_breakdown(surface_elements)
+            if primary:
+                out.surface_primary = primary
+                out.surface_breakdown = breakdown
+        else:
+            surf = surface_from_tags(tags)
+            if surf:
+                out.surface_primary = surf
+                out.surface_breakdown = json.dumps({surf: 1.0})
 
         mg, gain_ft = compute_max_grade_p95(coords)
         out.max_grade_p95 = mg
